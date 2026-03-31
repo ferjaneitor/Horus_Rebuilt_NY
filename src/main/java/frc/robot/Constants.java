@@ -3,13 +3,9 @@ package frc.robot;
 import com.ctre.phoenix6.signals.NeutralModeValue;
 import com.revrobotics.spark.config.SparkBaseConfig.IdleMode;
 
-import edu.wpi.first.math.Matrix;
-import edu.wpi.first.math.VecBuilder;
 import edu.wpi.first.math.geometry.Rotation3d;
 import edu.wpi.first.math.geometry.Transform3d;
 import edu.wpi.first.math.geometry.Translation3d;
-import edu.wpi.first.math.numbers.N1;
-import edu.wpi.first.math.numbers.N3;
 import static edu.wpi.first.units.Units.Inches;
 import static edu.wpi.first.units.Units.MetersPerSecond;
 import static edu.wpi.first.units.Units.RadiansPerSecond;
@@ -599,14 +595,14 @@ public final class Constants {
         // kP = 0.5: con error de 5 RPS (300 RPM de caida) → 2.5V de correccion instantanea.
         // Bajar a 0.3 si hay oscilacion visible en las RPM. Subir a 0.8 si sigue sin recuperar.
         public static final double FLYWHEEL_P = 5.0;
-        public static final double FLYWHEEL_I = 0.02;
+        public static final double FLYWHEEL_I = 0.0;  // sin windup — re-evaluar cuando el sistema este estable
         public static final double FLYWHEEL_D = 0.0;
         public static final double FLYWHEEL_V = 0.12; 
         public static final double FLYWHEEL_S = 0.10; 
         public static final double FLYWHEEL_A = 0.0;  
 
         /** Tolerancia de RPM para "listo para disparar" [RPM]. */
-        public static final double FLYWHEEL_RPM_TOLERANCE = 200.0;
+        public static final double FLYWHEEL_RPM_TOLERANCE = 350.0;
 
         /** Frecuencia de actualizacion de senales del flywheel [Hz]. */
         public static final double FLYWHEEL_SIGNAL_HZ = 50.0; // Coincide con el loop de 20ms
@@ -720,6 +716,14 @@ public final class Constants {
         // --- Tiro por defecto (sin vision / sin tag visible) ---
         /** RPM del flywheel en modo default (hood en home). TODO: calibrar en pista. */
         public static final double DEFAULT_SHOT_RPM = 3000.0; // TODO
+
+        /**
+         * RPM de fallback para modo FIXED_HOOD cuando la odometria aun no ha sido corregida
+         * por vision y la pose calculada esta fuera del rango de la lookup table [RPM].
+         * La tabla cubre 0.6m–8.0m; a 1.5m efectivo → ~1220 RPM con COMPENSATION_MULTIPLICATOR.
+         * Ajustar segun distancia tipica de prueba.
+         */
+        public static final double FIXED_HOOD_DEFAULT_RPM = 1500.0;
 
         // --- Limites de salida en control manual ---
         // Se usan en los comandos ManualXxxCommand para que el operador no pueda
@@ -902,7 +906,6 @@ public final class Constants {
         
         // --- Transforms robot → camara ---
         // Transform3d(Translation3d(adelante_m, izq_m, arriba_m), Rotation3d(roll, pitch, yaw))
-        // TODO: Medir con cinta desde el centro del robot a cada lente.
         public static final Transform3d ROBOT_TO_CAM_A1 = new Transform3d(
             new Translation3d(0.2794,  0.2794, 0.34),
             new Rotation3d(0.0, 0, 0.0)
@@ -921,88 +924,65 @@ public final class Constants {
         );
 
         // =========================================================================
-        // Std devs base para fusion con odometria
+        // Std devs fijos por camara — ajustar manualmente segun calibracion
         // =========================================================================
-        // SEMANTICA CORRECTA (Filtro de Kalman):
-        //   [x metros, y metros, theta radianes]
-        //   MAS ALTO = MENOS confianza → el filtro corrige MENOS la odometria con vision
-        //   MAS BAJO = MAS confianza  → el filtro corrige MAS la odometria con vision
-        //   No hay restriccion de rango — son metros/radianes reales, pueden ser > 1.
+        // SEMANTICA: [x_metros, y_metros, theta_radianes]
+        //   MAS ALTO = MENOS confianza  (el filtro corrige menos la odometria)
+        //   MAS BAJO = MAS confianza    (el filtro corrige mas la odometria)
         //
-        // Estos vectores son el caso BASE (distancia media, confianza normal, 1 o 2 tags).
-        // La formula dinamica los MULTIPLICA por un factor segun distancia/confianza:
-        //   - factor < 1: camara cerca y consistente → std devs menores → mas confianza
-        //   - factor > 1: camara lejos o inconsistente → std devs mayores → menos confianza
-        public static final Matrix<N3, N1> SINGLE_TAG_STD_DEVS =
-            VecBuilder.fill(1.5, 1.5, 3.0);   // 1 tag: position incierta, theta muy incierto
-        public static final Matrix<N3, N1> MULTI_TAG_STD_DEVS =
-            VecBuilder.fill(0.5, 0.5, 1.0);   // 2+ tags: mucho mas preciso en pose y heading
-
-        // =========================================================================
-        // Calibracion individual por camara
-        // =========================================================================
-        // CAM_*_STD_SCALE multiplica el vector base para cada camara individualmente.
-        //   1.0  = comportamiento base (punto de partida neutro)
-        //   < 1.0 (ej. 0.5) = esta camara es MAS precisa → confiar MAS → std devs menores
-        //   > 1.0 (ej. 2.0) = esta camara es MENOS precisa → confiar MENOS → std devs mayores
-        //   99.0 = desactivar la camara en practica (std devs gigantes)
+        // Para desactivar una camara completamente: pon STD_XY en 9999.0
         //
-        // COMO CALIBRAR (una camara a la vez):
-        //   1. Pon el robot en una posicion conocida del campo (ej. 2 m frente a un tag).
-        //   2. Sube las demas camaras a 99.0 temporalmente para ignorarlas.
-        //   3. Observa "Vision/NOMBRE_CAM/EstX" y "EstY" en SmartDashboard.
-        //   4. Compara con la posicion real:
-        //      - Error de 30+ cm repetible → camara imprecisa → sube a 1.5 o 2.0
-        //      - Error de ~5 cm consistente → camara muy buena → baja a 0.5 o 0.3
-        //   5. Para el heading: si el robot "brinca" al ver 1 solo tag,
-        //      sube el tercer valor de SINGLE_TAG_STD_DEVS (ej. 3.0 → 6.0).
-        //   6. Restaura las otras camaras y repite para cada una individualmente.
+        // POR QUE STD_THETA = 9999 EN TODAS:
+        // El heading lo maneja el giroscopio (Pigeon2), que es ~100x mas preciso
+        // que vision. Si vision modifica theta (4 camaras x 50 Hz), pelea con el
+        // gyro y el "frente" del field-centric cambia constantemente. 9999 = el
+        // filtro de Kalman ignora el theta de vision por completo.
+        // El unico knob util para calibrar es STD_XY, uno por camara.
 
-        /** Multiplicador de std devs para RIGHT_FRONT_CAM. 1.0=neutro, <1=mas confiable, >1=menos. */
-        public static final double CAM_A1_STD_SCALE = 1.0; // RIGHT_FRONT — TODO: calibrar
+        // FRONT_RIGHT_CAM
+        public static final double CAM_A1_STD_XY    = 0.8;
+        public static final double CAM_A1_STD_THETA = 9999.0;
 
-        /** Multiplicador de std devs para RIGHT_CAM. */
-        public static final double CAM_B1_STD_SCALE = 1.0; // RIGHT       — TODO: calibrar
+        // RIGHT_CAM
+        public static final double CAM_B1_STD_XY    = 0.8;
+        public static final double CAM_B1_STD_THETA = 9999.0;
 
-        /** Multiplicador de std devs para LEFT_FRONT_CAM. */
-        public static final double CAM_A2_STD_SCALE = 1.0; // LEFT_FRONT  — TODO: calibrar
+        // FRONT_LEFT_CAM
+        public static final double CAM_A2_STD_XY    = 0.8;
+        public static final double CAM_A2_STD_THETA = 9999.0;
 
-        /** Multiplicador de std devs para LEFT_CAM. */
-        public static final double CAM_B2_STD_SCALE = 1.0; // LEFT        — TODO: calibrar
-
-        /** Piso minimo del factor de escala dinamico — impide std devs de 0 (confianza infinita).
-         *  Subir si el robot "salta" a la pose de un tag cercano de golpe. */
-        public static final double CAM_STD_SCALE_FLOOR = 0.1;
+        // LEFT_CAM
+        public static final double CAM_B2_STD_XY    = 0.8;
+        public static final double CAM_B2_STD_THETA = 9999.0;
 
         // =========================================================================
-        // Umbrales de calidad
+        // Filtros de calidad y rechazo de outliers
         // =========================================================================
         /** Rechazar estimaciones con ambiguedad mayor a este valor [0.0–1.0]. */
         public static final double MAX_POSE_AMBIGUITY = 0.2;
 
-        /** Rechazar tags a mas de esta distancia (estimaciones lejanas son imprecisas) [m]. */
+        /** Rechazar tags a mas de esta distancia [m]. */
         public static final double MAX_TAG_DISTANCE_METERS = 6.0;
 
-        // =========================================================================
-        // Confianza dinamica por camara
-        // =========================================================================
-        /** Ganancia de confianza por frame consistente. */
-        public static final double CONFIDENCE_GAIN_PER_FRAME       = 0.03;
+        /** Si la pose de vision difiere mas de esto de la odometria actual, se rechaza.
+         *  Protege contra glitches de deteccion de tags que jalarian al robot de golpe. [m] */
+        public static final double MAX_VISION_POSE_JUMP_METERS = 5.0;
 
-        /** Decaimiento de confianza por frame sin targets. */
-        public static final double CONFIDENCE_DECAY_PER_FRAME      = 0.95;
-
-        /** Confianza inicial al arrancar [0.0–1.0]. */
-        public static final double CONFIDENCE_INITIAL              = 0.3;
-
-        /** Confianza minima — la camara nunca se ignora completamente. */
-        public static final double CONFIDENCE_MIN                  = 0.1;
-
-        /** Delta maximo entre poses consecutivas para considerar "consistente" [m]. */
-        public static final double POSE_CONSISTENCY_THRESHOLD_METERS = 0.5;
-
-        /** Penalizacion multiplicativa cuando la pose salta mas del umbral. */
-        public static final double CONFIDENCE_CONSISTENCY_PENALTY  = 0.5;
+        /**
+         * Velocidad maxima del robot para aceptar correcciones de vision [m/s].
+         *
+         * Por que existe esto:
+         *   Cuando el robot se mueve rapido, el filtro de Kalman hace "replay" de odometria
+         *   cada vez que vision manda una correccion (4 camaras x 50Hz = ~200/s). Odometria
+         *   y vision jalan en direcciones opuestas y la oscilacion se acumula como distancia
+         *   extra. A alta velocidad ademas la vision es menos precisa (latencia, motion blur).
+         *
+         *   Con 1.5 m/s: vision corrige cuando el robot esta casi parado o en movimiento lento
+         *   (por ejemplo al apuntar para disparar). En movimiento rapido la odometria manda.
+         *
+         *   Subir si el robot corrige pose durante el auto; bajar si siguen los saltos.
+         */
+        public static final double VISION_MAX_SPEED_MPS = 1.5;
     }
 
     // =========================================================================

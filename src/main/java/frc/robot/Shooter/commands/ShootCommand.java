@@ -184,6 +184,7 @@ public class ShootCommand extends Command {
 
     @Override
     public void end(boolean interrupted) {
+        indexerLatch = false;
         shooter.stopIndexer();
         shooter.coastFlywheel();
         shooter.homeHood();
@@ -250,19 +251,23 @@ public class ShootCommand extends Command {
         Alliance alliance = DriverStation.getAlliance().orElse(Alliance.Blue);
         Pose2d pose = drivetrain.getState().Pose;
         if (pose == null) {
-            // Sin pose — usar RPM default hasta que la odometria este disponible
-            shooter.setFlywheelRPM(ShooterConstants.DEFAULT_SHOT_RPM);
+            // Sin pose — usar RPM de fallback hasta que la odometria este disponible
+            shooter.setFlywheelRPM(ShooterConstants.FIXED_HOOD_DEFAULT_RPM);
             return;
         }
         ShooterResult result = ShooterMath.calculateFixedHood(pose, alliance);
         ShooterMath.publishToSmartDashboard(result);
         shooter.setFlywheelRPM(result.isValidShot()
             ? result.flywheelRPM()
-            : ShooterConstants.DEFAULT_SHOT_RPM);
+            : ShooterConstants.FIXED_HOOD_DEFAULT_RPM);
     }
 
     private void executeFixedHood() {
-        // Recalcular RPM en cada ciclo segun la distancia actual al objetivo
+        // Una vez que el indexer está latched, el disparo está en curso.
+        // No cambiar el target RPM: si la pose se corrige por visión a mitad del ciclo,
+        // el nuevo RPM calcualdo puede diferir 1000+ RPM del actual y matar el disparo.
+        if (indexerLatch) return;
+
         Alliance alliance = DriverStation.getAlliance().orElse(Alliance.Blue);
         Pose2d pose = drivetrain.getState().Pose;
         if (pose == null) return;
